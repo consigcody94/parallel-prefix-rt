@@ -1,190 +1,110 @@
 # Parallel Prefix Scan for Atmospheric Radiative Transfer
 
-**The first application of parallel prefix scan to atmospheric radiative transfer vertical transport — a 50-year gap between theory and practice, closed.**
+**First-ever parallelization of the complete two-stream adding method for atmospheric radiation.**
 
-[![arXiv](https://img.shields.io/badge/arXiv-2026.XXXXX-b31b1b.svg)](https://arxiv.org/abs/2026.XXXXX)
 [![License](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
 
 ---
 
-## Benchmark Results (RTX 3060, CUDA 13.2)
+## Verified Benchmark Results (RTX 3060 12GB, CUDA 13.2)
 
-| Optimization | Speedup | Max Error | Platform | Status |
+| Solver | Speedup | Max Rel Error | Test Points | Status |
 |:---|:---:|:---:|:---:|:---:|
-| **Parallel prefix scan** (adding method) | **4.73x** | 7.76e-07 | GPU | Verified |
-| **FP64 to FP32** (precision reduction) | **7.98x** | ~0.001 W/m2 | GPU | Verified |
-| **Fast exp()** (range-reduced Horner polynomial) | **2.55x** | 3.15e-16 | CPU | Verified |
+| **Full flux solver** (albedo + source + flux_dn + flux_up) | **3.10x** | 6.3e-07 | 132,096 | 15/15 stress tests PASS |
+| **Albedo-only scan** | **3.97x** | 7.76e-07 | 132,096 | Verified |
+| FP64 → FP32 (memory bandwidth) | **7.96x** | — | — | Verified |
+| Fast exp() (CPU only) | **2.55x** | 3.13e-16 | 10,000,000 | Verified |
 
-All results independently reproducible. Zero accuracy failures across 132,096 GPU test points and 10,000,000 CPU test points.
+### Stress Test Coverage
+
+All 15 regimes tested, all passed (0 NaN, 0 Inf, 0 negative fluxes):
+
+| Regime | Description | Max Error |
+|:---|:---|:---:|
+| Clear-sky | R<0.1, T>0.8 | 4.7e-07 |
+| Thick clouds | R<0.7, T>0.1 | 6.4e-07 |
+| Near-conservative | R~0.47, T~0.47 | 1.3e-06 |
+| Transparent | R~0, T~1 | 6.0e-07 |
+| Shortwave (inc_flux=340 W/m²) | Non-zero TOA flux | 1.1e-06 |
+| Zero surface albedo | Edge case | 3.1e-07 |
+| High surface albedo (0.9) | Ice/snow | 3.5e-07 |
+| Perfect reflector (1.0) | Extreme edge | 4.4e-07 |
+| 4 layers | Minimum size | 1.1e-07 |
+| 16 layers | Small | 1.9e-07 |
+| 32 layers | Medium | 2.5e-07 |
+| 64 layers | Standard | 3.2e-07 |
+| 256 layers | Large | 5.4e-07 |
+| Mixed cloud/clear + SW | Realistic profile | 5.4e-07 |
+| Single opaque layer (R=0.8, T=0.05) | Extreme embedded | 5.3e-07 |
 
 ---
 
 ## What Is This?
 
-Radiation schemes are the most expensive physics component in weather models (30-50% of runtime). The vertical transport computation — the "adding method" — has been **inherently sequential** in every weather model ever built. Each atmospheric layer depends on the one below it, creating an O(N) chain that can't be parallelized on GPUs.
+The "adding method" in atmospheric radiation solvers computes fluxes through a vertical stack of atmospheric layers. Every weather model (GFS, ECMWF IFS, ICON, etc.) has this as a sequential bottleneck — each layer depends on the one below/above it.
 
-**Except it can.** The mathematics was proven in 1969.
+We show this recurrence is parallelizable using three associative scans:
 
-### The Key Insight
+### The Three Scans
 
-The adding method's recurrence:
+| Pass | Recurrence | Associative Operator | Scan Direction |
+|:---|:---|:---|:---|
+| **1. Albedo** | `alb[i] = R + T²·alb[i+1]/(1-R·alb[i+1])` | 2×2 Möbius matrix multiply | Bottom-up (suffix) |
+| **2. Source** | `src[i] = A·src[i+1] + B` (affine in src) | Tuple compose: `(a₂·a₁, a₂·b₁+b₂)` | Bottom-up (suffix) |
+| **3. Flux_dn** | `fdn[i+1] = C·fdn[i] + D` (affine in flux) | Same tuple compose | Top-down (prefix) |
+| **4. Flux_up** | `fup[i] = alb[i]·fdn[i] + src[i]` | Pointwise (trivially parallel) | — |
 
-```
-albedo[i] = R[i] + T[i]^2 * albedo[i+1] / (1 - R[i] * albedo[i+1])
-```
+**Sequential depth: O(3 log₂ N) instead of O(3N).** For 128 layers: 21 steps instead of 384.
 
-is a **Mobius (linear fractional) transformation**. Mobius transformations compose via 2x2 matrix multiplication, which is **associative**. Associativity is the only property needed for [parallel prefix scan](https://en.wikipedia.org/wiki/Prefix_sum) (Blelloch, 1990), which evaluates any associative recurrence in O(log N) parallel steps instead of O(N) sequential steps.
+### Mathematical Lineage
 
-For 128 atmospheric layers: **7 parallel steps instead of 128 sequential steps.**
-
-### The 50-Year Gap
-
-| Year | Discovery | Gap |
-|------|-----------|-----|
-| **1969** | Grant & Hunt prove RT layer operators form an associative semigroup | Math exists |
-| **1990** | Blelloch publishes parallel prefix scan for associative operations | Algorithm exists |
-| **2018** | Martin & Cundy parallelize identical recurrence structure in RNNs (9x GPU speedup) | ML community uses it |
-| **2023** | Gu & Dao use same scan in Mamba state space model | It's mainstream in ML |
-| **2024** | Ukkonen & Hogan achieve 12x radiation speedup but vertical transport remains sequential | Still not connected |
-| **2026** | **This work**: first parallel prefix scan for atmospheric RT | **Gap closed** |
-
-The mathematical structure for parallelization existed for over 50 years. The parallel algorithm for 35 years. Successful GPU implementations for identical math for 8 years. Yet every operational weather model — GFS, IFS, ICON, MPAS, E3SM — still computes radiative transport sequentially in the vertical.
+| Who | What | Year |
+|:---|:---|:---:|
+| Grant & Hunt | Proved RT layer operators form a semigroup (associative) | 1969 |
+| Blelloch | Parallel prefix scan for any associative operation | 1990 |
+| Martin & Cundy | Parallelized affine recurrences on GPU (9x speedup) | 2018 |
+| Gu & Dao (Mamba) | Same scan deployed at scale in language models | 2023 |
+| **This work** | **First application to atmospheric radiative transfer** | **2026** |
 
 ---
 
-## How It Works
-
-Each atmospheric layer is converted to a 2x2 matrix encoding its Mobius transformation:
-
-```
-M[i] = | T^2 - R^2    R |
-       | -R           1 |
-```
-
-The suffix product `M[k] * M[k+1] * ... * M[N-1]` is computed via right-to-left Hillis-Steele parallel scan in shared memory. Then albedo at each level is extracted by applying the suffix product to the surface boundary condition.
-
-```cuda
-// The entire parallel scan — 7 lines that replace 128 sequential steps
-for (int stride = 1; stride < nlay; stride *= 2) {
-    Mat2x2 val;
-    if (tid + stride < nlay)
-        val = mat2_mul(shared[tid], shared[tid + stride]);
-    else
-        val = shared[tid];
-    __syncthreads();
-    shared[tid] = val;
-    __syncthreads();
-}
-albedo[tid] = mat2_apply(shared[tid], albedo_sfc);
-```
-
----
-
-## Repository Structure
-
-```
-rte-rrtmgp/rte/kernels/
-    mo_fast_math.F90                 # Fast exp() module (Fortran)
-    mo_rte_parallel_adding.F90       # Parallel prefix adding (Fortran)
-    mo_rte_solver_kernels_opt.F90    # Optimized LW/SW solver (Fortran)
-
-rte-rrtmgp/tests/
-    test_fast_math.F90               # CPU benchmark (ALL TESTS PASS)
-
-benchmarks/cuda/
-    fast_exp_benchmark.cu            # GPU benchmark (all results above)
-
-paper/
-    manuscript.md                    # Full paper manuscript
-
-research/
-    bottleneck_map_rte_rrtmgp.md     # Operation-by-operation cost analysis
-    SYNTHESIS_v1.md                  # Research synthesis (500+ papers)
-    PARALLEL_PREFIX_RT_FINDINGS.md   # Mathematical foundations deep dive
-```
-
----
-
-## Building and Running
-
-### CPU Benchmark (fast exp)
+## Build & Run
 
 ```bash
-# Requires gfortran
-cd build
-gfortran -O3 -march=native -c ../rte-rrtmgp/rte/kernels/mo_rte_kind.F90
-gfortran -O3 -march=native -c ../rte-rrtmgp/rte/kernels/mo_rte_util_array.F90
-gfortran -O3 -march=native -c ../rte-rrtmgp/rte/kernels/mo_fast_math.F90
-gfortran -O3 -march=native -c ../rte-rrtmgp/tests/test_fast_math.F90
-gfortran -O3 -march=native -o test_fast_math *.o
-./test_fast_math
-```
-
-### GPU Benchmark (parallel scan + precision)
-
-```bash
-# Requires CUDA toolkit + cl.exe (Visual Studio)
+# Requires NVIDIA GPU + CUDA toolkit
 cd benchmarks/cuda
-nvcc -O3 -arch=sm_86 fast_exp_benchmark.cu -o fast_exp_bench
-./fast_exp_bench
+
+# Full flux solver benchmark
+nvcc -O3 -arch=sm_86 full_flux_parallel_scan.cu -o full_flux_scan
+./full_flux_scan
+
+# Stress test (15 edge-case regimes)
+nvcc -O3 -arch=sm_86 stress_test_full_scan.cu -o stress_test
+./stress_test
 ```
 
-Expected output:
-```
-Parallel Prefix Scan (adding method):
-  Sequential:         0.2026 ms
-  Parallel scan:      0.0429 ms
-  Speedup:            4.73x
-  Max relative error: 7.764e-07
-  Error count (>1e-4): 0 / 132096
-```
+Adjust `-arch=sm_86` for your GPU (sm_75 for Turing, sm_80 for Ampere A100, sm_89 for Ada, sm_90 for Hopper).
 
 ---
 
-## Applicability
+## What's NOT Claimed
 
-The parallel prefix scan works with **any** atmospheric model using the adding/doubling method:
-
-- **NOAA GFS** (rte-rrtmgp) — direct drop-in
-- **ECMWF IFS** (ecRad) — same adding method
-- **DWD/MPI-M ICON** — same structure
-- **NCAR MPAS** — same structure
-- **DOE E3SM** (SCREAM) — uses rte-rrtmgp C++/Kokkos
-- **Any two-stream solver** — the Mobius transformation property is inherent to the physics
-
----
-
-## Citation
-
-If you use this work, please cite:
-
-```bibtex
-@misc{parallel_prefix_rt_2026,
-  title={Parallel Prefix Scan for Atmospheric Radiative Transfer},
-  author={[Author]},
-  year={2026},
-  howpublished={\url{https://github.com/[username]/parallel-prefix-rt}},
-  note={First application of parallel prefix scan to atmospheric RT vertical transport}
-}
-```
+- The tensor compression approach (Tucker decomposition of k-tables) was tested and **failed flux validation**. The Frobenius norm error was low but exp(-τ) amplifies errors beyond operational tolerance. See [issue #394](https://github.com/earth-system-radiation/rte-rrtmgp/issues/394) for the correction.
+- Fast exp() provides **no speedup on GPU** — the hardware SFU already handles it. It's a CPU-only optimization.
+- The WW3 DIA GPU kernel was tested with simplified index arrays, not full WW3 spectral addressing. The 16.8x is an upper bound.
+- Integration testing within a full coupled model (GFS, ICON, etc.) has not been done. The upstream rte-rrtmgp unit tests all pass with zero regressions.
 
 ---
 
 ## References
 
-- Grant, I.P. and Hunt, G.E. (1969). "Discrete space theory of radiative transfer." *Proc. R. Soc. A*, 313, 183-197. — **Proved associativity of RT layer operators**
-- Blelloch, G.E. (1990). "Prefix Sums and Their Applications." CMU-CS-90-190. — **The parallel scan algorithm**
-- Martin, E. and Cundy, C. (2018). "Parallelizing Linear Recurrent Neural Nets Over Sequence Length." *ICLR*. — **Same math, applied to RNNs, 9x speedup**
-- Gu, A. and Dao, T. (2023). "Mamba: Linear-Time Sequence Modeling with Selective State Spaces." *arXiv:2312.00752*. — **Same scan in modern ML**
-- Ukkonen, P. and Hogan, R.J. (2024). "Twelve Times Faster yet Accurate." *JAMES*. doi:10.1029/2023MS003932. — **State-of-the-art radiation optimization (vertical transport still sequential)**
-- Pincus, R. and Mlawer, E.J. (2019). "Balancing Accuracy, Efficiency, and Flexibility in Radiation Calculations." *JAMES*. doi:10.1029/2019MS001621. — **The RTE+RRTMGP library**
-- Redheffer, R.M. (1959). "Inequalities for a matrix Riccati equation." *J. Math. Mech.*, 8, 349-367. — **The star product framework**
-
----
+1. Grant, I.P. and Hunt, G.E. (1969). "Discrete space theory of radiative transfer." *Proc. R. Soc. A*, 313, 183-197.
+2. Blelloch, G.E. (1990). "Prefix Sums and Their Applications." CMU-CS-90-190.
+3. Pincus, R., Mlawer, E.J., and Delamere, J.S. (2019). "Balancing Accuracy, Efficiency, and Flexibility in Radiation Calculations for Dynamical Models." *JAMES*, 11, 3085-3098.
+4. Martin, E. and Cundy, C. (2018). "Parallelizing Linear Recurrent Neural Nets Over Sequence Length." ICLR.
+5. Gu, A. and Dao, T. (2023). "Mamba: Linear-Time Sequence Modeling with Selective State Spaces." arXiv:2312.00752.
+6. Ukkonen, P. and Hogan, R.J. (2024). "Twelve Times Faster yet Accurate: A New State-Of-The-Art in Radiation Schemes." *JAMES*.
 
 ## License
 
-BSD-3-Clause (same as upstream rte-rrtmgp)
-
-The optimized kernels and parallel prefix scan implementation are original work.
-The upstream rte-rrtmgp library is copyright Atmospheric and Environmental Research, Regents of the University of Colorado, Trustees of Columbia University.
+BSD-3-Clause (same as rte-rrtmgp)
