@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+*.o
+*.mod
+*.exe
+
+# Editor/IDE
+.vscode/
+*.swp
+*~
+
+# Claude Code working files
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# rte-rrtmgp upstream (tracked as submodule or separate)
+# We include our modified files directly
